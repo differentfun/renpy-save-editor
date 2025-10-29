@@ -1189,18 +1189,23 @@ class SaveEditorApp(tk.Tk):
 
         def key_func(row):
             name, typ, valrepr, iid = row
+            lower_name = name.lower() if isinstance(name, str) else str(name)
             if col == 'name':
-                return name.lower()
+                return lower_name
             if col == 'type':
-                return typ
+                return typ.lower() if isinstance(typ, str) else str(typ)
             if col == 'value':
                 v = self.roots.get(name)
                 if isinstance(v, bool):
-                    return int(v)
+                    return (0, int(v))
                 if isinstance(v, (int, float)):
-                    return v
-                return valrepr
-            return name.lower()
+                    return (1, v)
+                if isinstance(v, str):
+                    return (2, v.lower())
+                if v is None:
+                    return (3, '')
+                return (4, str(valrepr).lower())
+            return lower_name
 
         items.sort(key=key_func, reverse=self._sort_desc)
         for idx, (_, _, _, iid) in enumerate(items):
