@@ -7,6 +7,7 @@ import base64
 import pickle
 import importlib
 import struct
+import ast
 import types
 import copy
 import tkinter as tk
@@ -246,8 +247,13 @@ def _make_signatures(log_bytes: bytes) -> bytes:
 
 # ----------------- Pickle value parsing/patching -----------------
 
-SHORT_BINUNICODE = 0x4C
+STRING = 0x53
+BINSTRING = 0x54
+SHORT_BINSTRING = 0x55
+UNICODE = 0x56
 BINUNICODE = 0x58
+SHORT_BINUNICODE = 0x8C
+BINUNICODE8 = 0x8D
 BINVAL1 = 0x4B  # BININT1
 BINVAL2 = 0x4D  # BININT2
 BINVAL4 = 0x4A  # BININT
@@ -256,7 +262,6 @@ NEWTRUE = 0x88
 NEWFALSE = 0x89
 LONG1 = 0x8A
 LONG4 = 0x8B
-BINUNICODE8 = 0x8C
 
 
 def _parse_value_at(data: bytes, pos: int):
@@ -293,26 +298,42 @@ def _parse_value_at(data: bytes, pos: int):
                 return None
     if op == SHORT_BINUNICODE and pos + 2 <= len(data):
         ln = data[pos + 1]
-        end = pos + 2 + ln
+        start = pos + 2
+        end = start + ln
         if end <= len(data):
-            try:
-                return (data[pos + 2:end].decode('utf-8', 'replace'), end, 'SHORT_BINUNICODE')
-            except Exception:
-                return None
+            return (data[start:end].decode('utf-8', 'replace'), end, 'SHORT_BINUNICODE')
     if op == BINUNICODE and pos + 5 <= len(data):
         ln = struct.unpack('<I', data[pos + 1:pos + 5])[0]
-        end = pos + 5 + ln
+        start = pos + 5
+        end = start + ln
         if end <= len(data):
-            try:
-                return (data[pos + 5:end].decode('utf-8', 'replace'), end, 'BINUNICODE')
-            except Exception:
-                return None
+            return (data[start:end].decode('utf-8', 'replace'), end, 'BINUNICODE')
     if op == BINUNICODE8 and pos + 9 <= len(data):
         ln = struct.unpack('<Q', data[pos + 1:pos + 9])[0]
-        end = pos + 9 + ln
+        start = pos + 9
+        end = start + ln
         if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end, 'BINUNICODE8')
+    if op == SHORT_BINSTRING and pos + 2 <= len(data):
+        ln = data[pos + 1]
+        start = pos + 2
+        end = start + ln
+        if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end, 'SHORT_BINSTRING')
+    if op == BINSTRING and pos + 5 <= len(data):
+        ln = struct.unpack('<I', data[pos + 1:pos + 5])[0]
+        start = pos + 5
+        end = start + ln
+        if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end, 'BINSTRING')
+    if op in (STRING, UNICODE):
+        end = data.find(b'\n', pos)
+        if end != -1:
+            raw = data[pos + 1:end]
             try:
-                return (data[pos + 9:end].decode('utf-8', 'replace'), end, 'BINUNICODE8')
+                text = ast.literal_eval(raw.decode('ascii'))
+                if isinstance(text, str):
+                    return (text, end + 1, 'UNICODE' if op == UNICODE else 'STRING')
             except Exception:
                 return None
     # LONG1/LONG4 handling (integers outside 32-bit). We'll decode but only re-encode if new value fits 32-bit.
@@ -326,6 +347,53 @@ def _parse_value_at(data: bytes, pos: int):
         if pos + 5 + n <= len(data):
             mag = int.from_bytes(data[pos + 5:pos + 5 + n], 'little', signed=True)
             return (mag, pos + 5 + n, 'LONG4')
+    return None
+
+
+def _read_key_token(data: bytes, pos: int):
+    if pos >= len(data):
+        return None
+    op = data[pos]
+    if op == BINUNICODE and pos + 5 <= len(data):
+        ln = struct.unpack('<I', data[pos + 1:pos + 5])[0]
+        start = pos + 5
+        end = start + ln
+        if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end)
+    if op == SHORT_BINUNICODE and pos + 2 <= len(data):
+        ln = data[pos + 1]
+        start = pos + 2
+        end = start + ln
+        if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end)
+    if op == BINUNICODE8 and pos + 9 <= len(data):
+        ln = struct.unpack('<Q', data[pos + 1:pos + 9])[0]
+        start = pos + 9
+        end = start + ln
+        if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end)
+    if op == SHORT_BINSTRING and pos + 2 <= len(data):
+        ln = data[pos + 1]
+        start = pos + 2
+        end = start + ln
+        if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end)
+    if op == BINSTRING and pos + 5 <= len(data):
+        ln = struct.unpack('<I', data[pos + 1:pos + 5])[0]
+        start = pos + 5
+        end = start + ln
+        if end <= len(data):
+            return (data[start:end].decode('utf-8', 'replace'), end)
+    if op in (STRING, UNICODE):
+        end = data.find(b'\n', pos)
+        if end != -1:
+            raw = data[pos + 1:end]
+            try:
+                txt = ast.literal_eval(raw.decode('ascii'))
+                if isinstance(txt, str):
+                    return (txt, end + 1)
+            except Exception:
+                return None
     return None
 
 
@@ -346,52 +414,58 @@ def _encode_scalar(value, enc_hint=None):
         return b"\x8b" + struct.pack('<I', len(mag)) + mag
     if isinstance(value, str):
         raw = value.encode('utf-8')
+        if enc_hint == 'SHORT_BINSTRING' and len(raw) <= 0xFF:
+            return bytes([SHORT_BINSTRING, len(raw)]) + raw
+        if enc_hint == 'BINSTRING' and len(raw) <= 0xFFFFFFFF:
+            return bytes([BINSTRING]) + struct.pack('<I', len(raw)) + raw
+        if enc_hint in ('STRING', 'UNICODE'):
+            lit = repr(value).encode('utf-8')
+            return bytes([STRING if enc_hint == 'STRING' else UNICODE]) + lit + b'\n'
         if enc_hint == 'SHORT_BINUNICODE' and len(raw) <= 0xFF:
-            return b"\x4c" + bytes([len(raw)]) + raw
+            return bytes([SHORT_BINUNICODE, len(raw)]) + raw
         if enc_hint == 'BINUNICODE' and len(raw) <= 0xFFFFFFFF:
-            return b"\x58" + struct.pack('<I', len(raw)) + raw
+            return bytes([BINUNICODE]) + struct.pack('<I', len(raw)) + raw
         if enc_hint == 'BINUNICODE8':
-            return b"\x8c" + struct.pack('<Q', len(raw)) + raw
+            return bytes([BINUNICODE8]) + struct.pack('<Q', len(raw)) + raw
         if len(raw) <= 0xFF:
-            return b"\x4c" + bytes([len(raw)]) + raw
+            return bytes([SHORT_BINUNICODE, len(raw)]) + raw
         if len(raw) <= 0xFFFFFFFF:
-            return b"\x58" + struct.pack('<I', len(raw)) + raw
-        return b"\x8c" + struct.pack('<Q', len(raw)) + raw
+            return bytes([BINUNICODE]) + struct.pack('<I', len(raw)) + raw
+        return bytes([BINUNICODE8]) + struct.pack('<Q', len(raw)) + raw
     raise ValueError('Unsupported type')
 
 
 def patch_value_for_key(log_bytes: bytes, key: str, current_value, new_value):
-    kb = key.encode('utf-8')
+    target = key.decode('utf-8', 'replace') if isinstance(key, bytes) else str(key)
     i = 0
     n = len(log_bytes)
-    while True:
-        idx = log_bytes.find(kb, i)
-        if idx < 0:
-            break
-        # verify BINUNICODE just before key
-        if idx >= 5 and log_bytes[idx - 5] == BINUNICODE:
-            ln = struct.unpack('<I', log_bytes[idx - 4:idx])[0]
-            if ln == len(kb):
-                pos = idx + ln
-                # skip optional memo ops BINPUT/LONG_BINPUT
-                if pos + 1 <= n and log_bytes[pos] == ord('q'):
-                    pos += 2
-                if pos + 5 <= n and log_bytes[pos] == ord('r'):
-                    pos += 5
-                # Scan ahead a window to find a scalar opcode and verify it matches current_value
-                for look in range(0, 1024):
-                    pv = _parse_value_at(log_bytes, pos + look)
-                    if pv is None:
-                        continue
-                    val, vend, enc = pv
-                    if isinstance(current_value, float):
-                        equal = abs(float(val) - float(current_value)) < 1e-9
-                    else:
-                        equal = (val == current_value)
-                    if equal:
-                        rep = _encode_scalar(new_value, enc_hint=enc)
-                        return log_bytes[:pos + look] + rep + log_bytes[vend:]
-        i = idx + 1
+    while i < n:
+        parsed = _read_key_token(log_bytes, i)
+        if parsed is None:
+            i += 1
+            continue
+        ktext, next_pos = parsed
+        if ktext == target:
+            pos = next_pos
+            if pos + 1 <= n and log_bytes[pos] == ord('q'):
+                pos += 2
+            if pos + 5 <= n and log_bytes[pos] == ord('r'):
+                pos += 5
+            for look in range(0, 1024):
+                pv = _parse_value_at(log_bytes, pos + look)
+                if pv is None:
+                    continue
+                val, vend, enc = pv
+                if isinstance(current_value, bool):
+                    equal = bool(val) == bool(current_value)
+                elif isinstance(current_value, float):
+                    equal = abs(float(val) - float(current_value)) < 1e-9
+                else:
+                    equal = (val == current_value)
+                if equal:
+                    rep = _encode_scalar(new_value, enc_hint=enc)
+                    return log_bytes[:pos + look] + rep + log_bytes[vend:]
+        i = next_pos
     raise KeyError(f'Key not found or value encoding unsupported: {key}')
 
 

@@ -79,6 +79,7 @@ import struct
 import argparse
 import pickle
 import importlib
+import ast
 
 
 def read_zip_log(path):
@@ -123,6 +124,10 @@ NEWTRUE = 0x88
 NEWFALSE = 0x89
 LONG1 = 0x8A
 LONG4 = 0x8B
+BINSTRING = 0x54
+SHORT_BINSTRING = 0x55
+STRING = 0x53
+SHORT_BINUNICODE = 0x8C
 
 
 def _parse_value_at(data: bytes, pos: int):
@@ -177,16 +182,56 @@ def iter_numeric_entries(log_bytes, key_prefix=b'store.'):
     Uses a resilient scan similar to the GUI: after a key BINUNICODE, skip
     optional memo ops and scan forward a small window to find the first scalar.
     """
+    def _read_key(data, pos):
+        n = len(data)
+        if pos >= n:
+            return None
+        op = data[pos]
+        if op == BINUNICODE and pos + 5 <= n:
+            ln = struct.unpack('<I', data[pos + 1:pos + 5])[0]
+            start = pos + 5
+            end = start + ln
+            if end <= n:
+                return data[start:end], end
+        if op == SHORT_BINUNICODE and pos + 2 <= n:
+            ln = data[pos + 1]
+            start = pos + 2
+            end = start + ln
+            if end <= n:
+                return data[start:end], end
+        if op == BINSTRING and pos + 5 <= n:
+            ln = struct.unpack('<I', data[pos + 1:pos + 5])[0]
+            start = pos + 5
+            end = start + ln
+            if end <= n:
+                return data[start:end], end
+        if op == SHORT_BINSTRING and pos + 2 <= n:
+            ln = data[pos + 1]
+            start = pos + 2
+            end = start + ln
+            if end <= n:
+                return data[start:end], end
+        if op == STRING:
+            end = data.find(b'\n', pos)
+            if end != -1:
+                raw = data[pos + 1:end]
+                try:
+                    text = ast.literal_eval(raw.decode('ascii'))
+                    if isinstance(text, str):
+                        return text.encode('utf-8'), end + 1
+                except Exception:
+                    return None
+        return None
+
     i = 0
     n = len(log_bytes)
     while i < n:
-        if i + 5 <= n and log_bytes[i] == BINUNICODE:
-            ln = struct.unpack('<I', log_bytes[i + 1:i + 5])[0]
-            j = i + 5
-            kbytes = log_bytes[j:j + ln]
+        parsed = _read_key(log_bytes, i)
+        if parsed:
+            kbytes, next_pos = parsed
             # Basic sanity: filter by prefix if provided
             if (not key_prefix or kbytes.startswith(key_prefix)) and b'\x00' not in kbytes:
-                pos = j + ln
+                pos = next_pos
                 # Skip BINPUT 'q' and LONG_BINPUT 'r' if present
                 if pos + 1 <= n and log_bytes[pos] == ord('q'):
                     pos += 2
@@ -202,7 +247,7 @@ def iter_numeric_entries(log_bytes, key_prefix=b'store.'):
                         key = kbytes.decode('utf-8', 'replace')
                         yield (key, val, pos + look, log_bytes[pos + look:vend])
                         break
-            i = j + ln
+            i = next_pos
         else:
             i += 1
 
@@ -225,31 +270,10 @@ def _encode_scalar(value):
 
 def patch_numeric_value(log_bytes, key, new_value):
     # Replace the scalar bytes that follow the given key, using parsed span length.
-    key_b = key.encode('utf-8')
-    i = 0
-    n = len(log_bytes)
-    while i < n:
-        idx = log_bytes.find(key_b, i)
-        if idx == -1:
-            break
-        if idx >= 5 and log_bytes[idx - 5] == BINUNICODE:
-            ln = struct.unpack('<I', log_bytes[idx - 4:idx])[0]
-            if ln == len(key_b):
-                pos = idx + ln
-                if pos + 1 <= n and log_bytes[pos] == ord('q'):
-                    pos += 2
-                if pos + 5 <= n and log_bytes[pos] == ord('r'):
-                    pos += 5
-                # Find current scalar value span
-                for look in range(0, 1024):
-                    pv = _parse_value_at(log_bytes, pos + look)
-                    if pv is None:
-                        continue
-                    cur, vend, enc = pv
-                    # Only allow setting ints/bools via CLI
-                    rep = _encode_scalar(new_value)
-                    return log_bytes[:pos + look] + rep + log_bytes[vend:]
-        i = idx + 1
+    rep = _encode_scalar(new_value)
+    for k, cur, pos, vbytes in iter_numeric_entries(log_bytes, key_prefix=b''):
+        if k == key:
+            return log_bytes[:pos] + rep + log_bytes[pos + len(vbytes):]
     raise KeyError(f"Key not found or unsupported encoding for: {key}")
 
 
